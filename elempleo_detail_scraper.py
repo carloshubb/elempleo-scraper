@@ -1,0 +1,284 @@
+# elempleo_detail_scraper.py
+# -----------------------------
+# This version automatically collects all job IDs from Elempleo
+# and scrapes each job's detail page.
+# -----------------------------
+import time
+import csv
+import re
+from datetime import datetime
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from datetime import datetime, timedelta
+
+# ---------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------
+BASE_URL = "https://www.elempleo.com/cr/ofertas-empleo/"
+DETAIL_BASE_URL = "https://www.elempleo.com/cr/ofertas-trabajo/"
+HEADERS = [
+    "_job_featured_image","_job_title", "_job_featured", "_job_filled", "_job_urgent", "_job_description",
+    "_job_category", "_job_type", "_job_tag", "_job_expiry_date", "_job_gender",
+    "_job_apply_type", "_job_apply_url", "_job_apply_email",
+    "_job_salary_type", "_job_salary", "_job_max_salary",
+    "_job_experience", "_job_career_level", "_job_qualification", "_job_video_url", "_job_photos",
+    "_job_application_deadline_date", "_job_address", "_job_location", "_job_map_location"
+]
+
+# ---------------------------------------------------------------
+# 1️⃣  Function to automatically collect job IDs
+# ---------------------------------------------------------------
+def get_job_ids_with_playwright(max_scrolls=15, scroll_delay=1.5):
+    """Scroll through Elempleo listings and extract all job IDs."""
+    print("🚀 Launching browser to collect job IDs...")
+    job_ids = set()
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+
+        try:
+            page.goto(BASE_URL, wait_until="load", timeout=90000)
+            time.sleep(4)
+
+            for scroll in range(1, max_scrolls + 1):
+                page.mouse.wheel(0, 50000)
+                time.sleep(scroll_delay)
+
+                html = page.content()
+                soup = BeautifulSoup(html, "html.parser")
+
+                for btn in soup.find_all("button", attrs={"data-joboffer": True}):
+                    job_ids.add(btn["data-joboffer"])
+
+                print(f"  ✓ Scroll {scroll}: {len(job_ids)} unique IDs")
+
+            print(f"\n✅ Total job IDs found: {len(job_ids)}")
+
+        except PlaywrightTimeout:
+            print("⚠️ Timeout while loading listings page.")
+        except Exception as e:
+            print(f"❌ Error while collecting IDs: {e}")
+        finally:
+            browser.close()
+
+    return list(job_ids)
+
+# ---------------------------------------------------------------
+# 2️⃣  Helper function to extract text
+# ---------------------------------------------------------------
+def extract_text(soup, selector):
+    el = soup.select_one(selector)
+    if el:
+        return el.get_text(strip=True)
+    return ""
+
+# ---------------------------------------------------------------
+# 3️⃣  Scrape details for one job
+# ---------------------------------------------------------------
+def get_job_details(page, job_url):
+    """Visit job URL and extract key fields"""
+    job = {key: "" for key in HEADERS}
+    try:
+        page.goto(job_url, wait_until="load", timeout=60000)
+        time.sleep(3)
+        html = page.content()
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Featured image
+        img = soup.select_one("img[src*='empleo'], img[src*='ofertas']")
+        if img:
+            job["_job_featured_image"] = img["src"]
+
+        # ✅ Improved description extraction (preserve line breaks)
+        desc_container = soup.select_one(".description-block span")
+        if desc_container:
+                # Replace <br> tags with newlines
+                for br in desc_container.find_all("br"):
+                    br.replace_with("\n")
+
+                parts = []
+                for child in desc_container.children:
+                    if child.name == "p":
+                        parts.append(child.get_text(strip=True))
+                    elif child.name == "ul":
+                        for li in child.find_all("li"):
+                            parts.append(f"• {li.get_text(strip=True)}")
+                    elif child.string and child.string.strip():
+                        # catch plain text nodes not wrapped in <p>
+                        parts.append(child.string.strip())
+
+                detail_desc = "\n".join(parts)
+                # Clean up multiple consecutive newlines
+                detail_desc = re.sub(r'\n+', '\n', detail_desc)
+
+                job = {}
+                job["_job_description"] = detail_desc
+        job["_job_title"] = extract_text(soup, ".category, [class*='categoria'], .breadcrumb li:last-child")
+        # Category or type
+        job["_job_category"] = extract_text(soup, ".js-position-area")
+        # Default job type
+        job_type = "Tiempo completo"
+
+        # Example: suppose job type info may appear in a <span>, <div>, or <p>
+        # You can adjust the selector to match your real HTML
+        span = soup.find("span")
+        if span:
+            text = span.get_text(strip=True).lower()
+            if "Medio tiempo" in text or "medio tiempo" in text:
+                job_type = "Medio tiempo"
+            elif "Remoto" in text or "Remoto" in text:
+                job_type = "Remoto"
+            elif "Tiempo completo" in text or "tiempo completo" in text:
+                job_type = "Tiempo completo"
+
+            job["_job_type"]=job_type
+        # Salary info
+        salary_text = extract_text(soup, "[class*='salario'], .js-joboffer-salary, .compensation")
+        job["_job_salary"] = salary_text
+        if salary_text:
+            numbers = re.findall(r"[\d,.]+", salary_text)
+            if len(numbers) >= 1:
+                job["_job_salary_type"] = "Mensual"
+                job["_job_max_salary"] = numbers[-1]
+
+        # Location
+        job["_job_location"] = extract_text(soup, "[class*='ubicacion'], .js-joboffer-city, [itemprop='addressLocality']")
+        job["_job_address"] = job["_job_location"]
+
+        # Expiry / deadline date
+        # job["_job_application_deadline_date"] = extract_text(soup, "time, [class*='js-publish-date'], [class*='publicado']")
+        deadline_date = datetime.today() + timedelta(days=30)
+
+        # Try to extract a date string
+        span = soup.find("span")
+        if span:
+            raw_text = span.get_text(strip=True)
+            parsed_date = None
+
+            # Try different common formats
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y"):
+                try:
+                    parsed_date = datetime.strptime(raw_text, fmt)
+                    break
+                except ValueError:
+                    continue
+
+            if parsed_date:
+                deadline_date = parsed_date
+
+        # Always output in YYYY-MM-DD format
+        job["_job_application_deadline_date"] = deadline_date.strftime("%Y-%m-%d")
+
+          # Experience / qualification
+        #job["experience"] = extract_text(soup, "[class*='experiencia'], .experience")
+        data_spans = soup.select(".data-column span")
+        for span in data_spans:
+            text = span.get_text(strip=True)
+            if "experiencia" in text.lower() or "años" in text.lower():
+                job["_job_experience"] = text
+                break
+        else:
+            job["_job_experience"] = ""
+        job["_job_qualification"] = extract_text(soup, "[class*='js-education-level'], [class*='formacion']")
+       
+        icon = soup.find("i", class_="fa fa-level-down fa-fw")
+
+        # Get its next <span>
+        if icon:
+            span = icon.find_next("span")
+            if span:
+              job["_job_career_level"]= span.get_text(strip=True)
+        # Apply email or URL
+        email_match = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", soup.get_text())
+        if email_match:
+            job["_job_apply_email"] = email_match.group(0)
+
+        # link = soup.select_one("a[href*='apply'], a[href*='postulate']")
+        # if link:
+        #     job["_job_apply_url"] = link["href"]
+        _job_apply_url = None
+
+        meta = soup.find("meta", attrs={"property": "og:url"})
+        if meta and meta.get("content"): 
+            _job_apply_url = meta["content"]
+        job["_job_apply_url"] = _job_apply_url
+        print("_job_apply_url =", _job_apply_url)    
+
+        # Optional placeholders
+        job["_job_featured"] = "1"
+        job["_job_filled"] = "0"
+        job["_job_urgent"] = "0"
+        job["_job_gender"] = ""
+        job["_job_tag"] = "Costa Rica"
+        job["_job_video_url"] = ""
+        job["_job_photos"] = ""
+        job["_job_map_location"] = ""
+        job["_job_apply_type"] = "external"
+
+
+        expiry_date = datetime.today() + timedelta(days=30)
+
+     # Try to extract a date from the HTML
+        span = soup.find("span")
+        if span:
+            text = span.get_text(strip=True)
+            try:
+                # Try parsing it – adjust format to match website (e.g. "YYYY-MM-DD" or "DD/MM/YYYY")
+                expiry_date = datetime.strptime(text, "%Y-%m-%d")
+            except ValueError:
+                # If parsing fails, just keep the default 30 days
+                pass
+        job["_job_expiry_date"] = expiry_date.strftime("%Y-%m-%d")
+        print("Job expiry date:", expiry_date.strftime("%Y-%m-%d"))
+        
+        # job["_job_expiry_date"] = job["_job_application_deadline_date"]
+
+        return job
+
+    except Exception as e:
+        print(f"❌ Error scraping {job_url}: {e}")
+        return job
+
+# ---------------------------------------------------------------
+# 4️⃣  MAIN SCRAPER
+# ---------------------------------------------------------------
+def main():
+    print("\n🚀 Starting Elempleo Auto Job Scraper...")
+
+    # Step 1: Collect job IDs automatically
+    job_ids = get_job_ids_with_playwright(max_scrolls=15, scroll_delay=1.5)
+    if not job_ids:
+        print("⚠️ No job IDs found.")
+        return
+
+    print(f"✅ Found {len(job_ids)} job IDs. Starting detail scraping...")
+
+    results = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+
+        for idx, job_id in enumerate(job_ids, 1):
+            job_url = f"{DETAIL_BASE_URL}{job_id}"
+            print(f"[{idx}/{len(job_ids)}] Scraping {job_url} ...")
+            job_data = get_job_details(page, job_url)
+            results.append(job_data)
+
+        browser.close()
+
+    # Step 2: Save results to CSV
+    filename = f"elempleo_job_details_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    with open(filename, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=HEADERS)
+        writer.writeheader()
+        writer.writerows(results)
+
+    print(f"\n✅ Saved {len(results)} jobs to {filename}")
+    print("🎉 Done!")
+
+
+if __name__ == "__main__":
+    main()
