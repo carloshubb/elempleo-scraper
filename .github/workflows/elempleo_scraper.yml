@@ -1,8 +1,7 @@
 name: Elempleo Job Scraper
 
 on:
-  schedule:
-    - cron: "0 2 * * *"   # Runs every day at 02:00 UTC
+  
   workflow_dispatch:       # Allows manual trigger
 
 jobs:
